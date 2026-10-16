@@ -11,7 +11,7 @@ const app = express();
 app.use(express.json({ limit: "5mb" }));
 app.use("/public", express.static(path.join(process.cwd(), "public")));
 
-const OPEN = ["/health"];
+const OPEN = ["/health", "/"];
 app.use((req, res, next) => {
   if (OPEN.some(p => req.path.startsWith(p))) return next();
   if (req.header("x-api-key") !== process.env.API_KEY)
@@ -20,6 +20,26 @@ app.use((req, res, next) => {
 });
 
 app.get("/health", (_req, res) => res.json({ ok: true, uptime: process.uptime() }));
+
+app.get("/", (_req, res) => {
+  res.json({
+    name: "Website Change Detector API",
+    version: "1.0.0",
+    status: "running",
+    auth: "Send x-api-key header on all endpoints except /health",
+    endpoints: [
+      "GET    /health",
+      "POST   /monitors",
+      "GET    /monitors",
+      "GET    /monitors/:id",
+      "DELETE /monitors/:id",
+      "POST   /monitors/:id/check",
+      "GET    /monitors/:id/history",
+      "GET    /monitors/:id/compare/:v1/:v2",
+      "GET    /alerts",
+    ],
+  });
+});
 
 app.post("/monitors", async (req, res) => {
   const { url, name, intervalMins, sensitivity, ignoreSelectors, watchSelectors } = req.body;
