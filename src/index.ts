@@ -11,7 +11,7 @@ const app = express();
 app.use(express.json({ limit: "5mb" }));
 app.use("/public", express.static(path.join(process.cwd(), "public")));
 
-const OPEN = ["/health", "/"];
+const OPEN = ["/health"];
 app.use((req, res, next) => {
   if (OPEN.some(p => req.path.startsWith(p))) return next();
   if (req.header("x-api-key") !== process.env.API_KEY)
@@ -73,10 +73,13 @@ app.get("/monitors/:id", async (req, res) => {
 });
 
 app.delete("/monitors/:id", async (req, res) => {
-  await prisma.monitor.delete({ where: { id: req.params.id } });
-  res.json({ ok: true });
+  try {
+    await prisma.monitor.delete({ where: { id: req.params.id } });
+    res.json({ ok: true });
+  } catch {
+    res.status(404).json({ error: "Not found" });
+  }
 });
-
 app.post("/monitors/:id/check", async (req, res) => {
   const m = await prisma.monitor.findUnique({ where: { id: req.params.id } });
   if (!m) return res.status(404).json({ error: "Not found" });
@@ -118,6 +121,11 @@ app.get("/alerts", async (_req, res) => {
     include: { monitor: { select: { name: true, url: true } } },
   });
   res.json(alerts);
+});
+
+app.use((err: any, _req: any, res: any, _next: any) => {
+  console.error("Error:", err.message);
+  res.status(500).json({ error: err.message || "Internal error" });
 });
 
 const PORT = Number(process.env.PORT) || 3000;
