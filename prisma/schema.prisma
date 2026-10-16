@@ -1,0 +1,42 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Monitor {
+  id              String         @id @default(uuid())
+  url             String
+  name            String
+  intervalMins    Int
+  sensitivity     Int            @default(5)
+  ignoreSelectors String?
+  watchSelectors  String?
+  lastCheckedAt   DateTime?
+  lastChangedAt   DateTime?
+  status          String         @default("OK")
+  snapshots       Snapshot[]
+  alerts          Alert[]
+}
+
+model Snapshot {
+  id          String   @id @default(uuid())
+  monitorId   String
+  monitor     Monitor  @relation(fields: [monitorId], references: [id], onDelete: Cascade)
+  contentHash String
+  textContent String
+  imagePath   String
+  diffPath    String?
+  createdAt   DateTime @default(now())
+}
+
+model Alert {
+  id        String   @id @default(uuid())
+  monitorId String
+  monitor   Monitor  @relation(fields: [monitorId], references: [id], onDelete: Cascade)
+  summary   String
+  sentAt    DateTime @default(now())
+}
