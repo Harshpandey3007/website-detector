@@ -13,9 +13,11 @@
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
     "@prisma/client": "^5.22.0",
+    "@types/cors": "^2.8.19",
     "axios": "^1.7.9",
     "bullmq": "^5.34.0",
     "cheerio": "^1.0.0",
+    "cors": "^2.8.6",
     "diff": "^5.2.0",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",

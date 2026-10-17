@@ -1,4 +1,7 @@
 import swaggerUi from "swagger-ui-express";
+import cors from "cors";
+
+
 import { swaggerSpec } from "./swagger";
 import { register } from "./metrics";
 import "dotenv/config";
@@ -34,6 +37,7 @@ const createMonitorSchema = z.object({
 });
 
 const app = express();
+app.use(cors()); 
 app.set("trust proxy", 1); // Render terminates TLS in front of the app; needed for per-client rate limits
 app.use(express.json({ limit: "100kb" }));
 app.use(rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: true, legacyHeaders: false }));
