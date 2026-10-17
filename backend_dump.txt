@@ -1,0 +1,535 @@
+﻿# BACKEND SOURCE DUMP
+
+
+
+===== FILE: src\alerts.ts =====
+
+import axios from "axios";
+import { prisma } from "./db";
+
+export async function sendDiscord(content: string) {
+  const webhook = process.env.DISCORD_WEBHOOK_URL;
+  if (!webhook) return;
+  try { await axios.post(webhook, { content }); }
+  catch (err) { console.error("Discord failed:", err); }
+}
+
+export async function shouldSendAlert(monitorId: string, windowMinutes = 30): Promise<boolean> {
+  const since = new Date(Date.now() - windowMinutes * 60_000);
+  const recent = await prisma.alert.findFirst({ where: { monitorId, sentAt: { gte: since } } });
+  return !recent;
+}
+
+export async function recordAlert(monitorId: string, summary: string) {
+  await prisma.alert.create({ data: { monitorId, summary } });
+}
+
+
+===== FILE: src\db.ts =====
+
+import { PrismaClient } from "@prisma/client";
+export const prisma = new PrismaClient();
+
+
+===== FILE: src\differ.ts =====
+
+import { diffLines } from "diff";
+import pixelmatch from "pixelmatch";
+import { PNG } from "pngjs";
+import fs from "fs/promises";
+import path from "path";
+
+const DIFF_DIR = path.join(process.cwd(), "public", "diffs");
+
+export function textDiff(oldText: string, newText: string) {
+  const parts = diffLines(oldText, newText);
+  let added = 0, removed = 0, unchanged = 0;
+  const htmlParts: string[] = [];
+  for (const p of parts) {
+    const esc = p.value.replace(/</g, "&lt;");
+    if (p.added) { added += p.value.length; htmlParts.push(`<ins>${esc}</ins>`); }
+    else if (p.removed) { removed += p.value.length; htmlParts.push(`<del>${esc}</del>`); }
+    else { unchanged += p.value.length; htmlParts.push(`<span>${esc}</span>`); }
+  }
+  const total = added + removed + unchanged || 1;
+  const changeRatio = (added + removed) / total;
+  return {
+    changed: added + removed > 0,
+    changeRatio,
+    summary: `+${added} / -${removed} chars (${(changeRatio * 100).toFixed(1)}%)`,
+    html: htmlParts.join("\n"),
+  };
+}
+
+export async function visualDiff(oldPath: string, newPath: string) {
+  try {
+    await fs.mkdir(DIFF_DIR, { recursive: true });
+    const oldBuf = PNG.sync.read(await fs.readFile(oldPath));
+    const newBuf = PNG.sync.read(await fs.readFile(newPath));
+    const width = Math.min(oldBuf.width, newBuf.width);
+    const height = Math.min(oldBuf.height, newBuf.height);
+
+    const a = new PNG({ width, height }); const b = new PNG({ width, height });
+    PNG.bitblt(oldBuf, a, 0, 0, width, height, 0, 0);
+    PNG.bitblt(newBuf, b, 0, 0, width, height, 0, 0);
+
+    const diff = new PNG({ width, height });
+    pixelmatch(a.data, b.data, diff.data, width, height, { threshold: 0.1 });
+
+    const diffPath = path.join(DIFF_DIR, `${Date.now()}-diff.png`);
+    await fs.writeFile(diffPath, PNG.sync.write(diff));
+    return { diffPath };
+  } catch { return null; }
+}
+
+
+===== FILE: src\index.ts =====
+
+import "dotenv/config";
+import express from "express";
+import path from "path";
+import { prisma } from "./db";
+import { isSafeUrl } from "./ssrf";
+import { checkQueue } from "./queue";
+import "./scheduler";
+import "./worker";
+
+const app = express();
+app.use(express.json({ limit: "5mb" }));
+app.use("/public", express.static(path.join(process.cwd(), "public")));
+
+const OPEN = ["/health", "/"];
+app.use((req, res, next) => {
+  if (OPEN.some(p => req.path.startsWith(p))) return next();
+  if (req.header("x-api-key") !== process.env.API_KEY)
+    return res.status(401).json({ error: "Unauthorized" });
+  next();
+});
+
+app.get("/health", (_req, res) => res.json({ ok: true, uptime: process.uptime() }));
+
+app.get("/", (_req, res) => {
+  res.json({
+    name: "Website Change Detector API",
+    version: "1.0.0",
+    status: "running",
+    auth: "Send x-api-key header on all endpoints except /health",
+    endpoints: [
+      "GET    /health",
+      "POST   /monitors",
+      "GET    /monitors",
+      "GET    /monitors/:id",
+      "DELETE /monitors/:id",
+      "POST   /monitors/:id/check",
+      "GET    /monitors/:id/history",
+      "GET    /monitors/:id/compare/:v1/:v2",
+      "GET    /alerts",
+    ],
+  });
+});
+
+app.post("/monitors", async (req, res) => {
+  const { url, name, intervalMins, sensitivity, ignoreSelectors, watchSelectors } = req.body;
+  if (!url || !name || !intervalMins) return res.status(400).json({ error: "url, name, intervalMins required" });
+  if (intervalMins < 15 || intervalMins > 1440) return res.status(400).json({ error: "intervalMins must be 15â€“1440" });
+
+  const safe = await isSafeUrl(url);
+  if (!safe.ok) return res.status(400).json({ error: safe.reason });
+
+  const monitor = await prisma.monitor.create({
+    data: {
+      url, name, intervalMins,
+      sensitivity: sensitivity ?? 5,
+      ignoreSelectors: ignoreSelectors ?? null,
+      watchSelectors: watchSelectors ?? null,
+    },
+  });
+
+  await checkQueue.add("check", { url }, { jobId: url, attempts: 3 });
+  res.status(201).json(monitor);
+});
+
+app.get("/monitors", async (_req, res) => {
+  res.json(await prisma.monitor.findMany({ orderBy: { name: "asc" } }));
+});
+
+app.get("/monitors/:id", async (req, res) => {
+  const m = await prisma.monitor.findUnique({ where: { id: req.params.id } });
+  if (!m) return res.status(404).json({ error: "Not found" });
+  res.json(m);
+});
+
+app.delete("/monitors/:id", async (req, res) => {
+  await prisma.monitor.delete({ where: { id: req.params.id } });
+  res.json({ ok: true });
+});
+
+app.post("/monitors/:id/check", async (req, res) => {
+  const m = await prisma.monitor.findUnique({ where: { id: req.params.id } });
+  if (!m) return res.status(404).json({ error: "Not found" });
+  await checkQueue.add("check", { url: m.url }, { jobId: m.url, attempts: 3 });
+  res.json({ queued: true });
+});
+
+app.get("/monitors/:id/history", async (req, res) => {
+  const snaps = await prisma.snapshot.findMany({
+    where: { monitorId: req.params.id },
+    orderBy: { createdAt: "desc" },
+    select: { id: true, contentHash: true, imagePath: true, diffPath: true, createdAt: true },
+  });
+  res.json(snaps);
+});
+
+app.get("/monitors/:id/compare/:v1/:v2", async (req, res) => {
+  const { v1, v2 } = req.params;
+  const [a, b] = await Promise.all([
+    prisma.snapshot.findUnique({ where: { id: v1 } }),
+    prisma.snapshot.findUnique({ where: { id: v2 } }),
+  ]);
+  if (!a || !b) return res.status(404).json({ error: "Snapshot not found" });
+
+  const { textDiff } = await import("./differ");
+  const td = textDiff(a.textContent, b.textContent);
+
+  res.json({
+    v1: { id: a.id, createdAt: a.createdAt, image: a.imagePath, text: a.textContent },
+    v2: { id: b.id, createdAt: b.createdAt, image: b.imagePath, text: b.textContent },
+    diff: { html: td.html, summary: td.summary, changeRatio: td.changeRatio },
+    visualDiff: b.diffPath,
+  });
+});
+
+app.get("/alerts", async (_req, res) => {
+  const alerts = await prisma.alert.findMany({
+    orderBy: { sentAt: "desc" }, take: 100,
+    include: { monitor: { select: { name: true, url: true } } },
+  });
+  res.json(alerts);
+});
+
+const PORT = Number(process.env.PORT) || 3000;
+app.listen(PORT, () => console.log(`ðŸš€ API on http://localhost:${PORT}`));
+
+
+===== FILE: src\noise.ts =====
+
+const PATTERNS: Array<[RegExp, string]> = [
+  [/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?/g, "[TS]"],
+  [/\b\d{1,2}:\d{2}(:\d{2})?\s?(AM|PM|am|pm)?\b/g, "[TIME]"],
+  [/\b\d{4}-\d{2}-\d{2}\b/g, "[DATE]"],
+  [/\b\d{1,2}\/\d{1,2}\/\d{2,4}\b/g, "[DATE]"],
+  [/\b[a-f0-9]{32,}\b/gi, "[TOKEN]"],
+  [/\b[A-Za-z0-9_-]{40,}\b/g, "[TOKEN]"],
+  [/\b\d{1,3}(,\d{3})+\b/g, "[NUM]"],
+  [/\b\d{4,}\b/g, "[NUM]"],
+];
+
+export function stripNoise(text: string): string {
+  let out = text;
+  for (const [re, rep] of PATTERNS) out = out.replace(re, rep);
+  return out.replace(/\s+/g, " ").trim();
+}
+
+
+===== FILE: src\queue.ts =====
+
+import { Queue, QueueEvents } from "bullmq";
+import IORedis from "ioredis";
+
+export const connection = new IORedis(process.env.REDIS_URL || "redis://127.0.0.1:6379", {
+  maxRetriesPerRequest: null,
+});
+
+export const CHECK_QUEUE = "check-queue";
+export const checkQueue = new Queue(CHECK_QUEUE, { connection });
+export const queueEvents = new QueueEvents(CHECK_QUEUE, { connection });
+
+
+===== FILE: src\scheduler.ts =====
+
+import cron from "node-cron";
+import { prisma } from "./db";
+import { checkQueue } from "./queue";
+
+cron.schedule("* * * * *", async () => {
+  try {
+    const now = new Date();
+    const monitors = await prisma.monitor.findMany();
+    const due = new Set<string>();
+
+    for (const m of monitors) {
+      if (!m.lastCheckedAt) { due.add(m.url); continue; }
+      if (new Date(m.lastCheckedAt.getTime() + m.intervalMins * 60_000) <= now) due.add(m.url);
+    }
+
+    for (const url of due) {
+      await checkQueue.add("check", { url }, {
+        jobId: url, attempts: 3,
+        backoff: { type: "exponential", delay: 30_000 },
+        removeOnComplete: true,
+      });
+    }
+    if (due.size) console.log(`â± Scheduled ${due.size} URLs`);
+  } catch (err) { console.error("Scheduler:", err); }
+});
+
+console.log("â° Scheduler started");
+
+
+===== FILE: src\scraper.ts =====
+
+import { chromium } from "playwright-extra";
+import stealth from "puppeteer-extra-plugin-stealth";
+import * as cheerio from "cheerio";
+import crypto from "crypto";
+import fs from "fs/promises";
+import path from "path";
+import { stripNoise } from "./noise";
+
+chromium.use(stealth());
+const SCREENSHOT_DIR = path.join(process.cwd(), "public", "screenshots");
+
+export interface ScrapeResult {
+  ok: boolean;
+  status: "OK" | "ERROR" | "BLOCKED";
+  reason?: string;
+  html?: string;
+  screenshotPath?: string;
+}
+
+export async function fetchPage(url: string): Promise<ScrapeResult> {
+  await fs.mkdir(SCREENSHOT_DIR, { recursive: true });
+  const browser = await chromium.launch({ headless: true, args: ["--no-sandbox"] });
+  try {
+    const ctx = await browser.newContext({
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+      viewport: { width: 1440, height: 900 },
+    });
+    const page = await ctx.newPage();
+    const resp = await page.goto(url, { waitUntil: "networkidle", timeout: 30000 });
+    const status = resp?.status() ?? 0;
+    const title = (await page.title()).toLowerCase();
+    const body = await page.evaluate(() => document.body?.innerText || "");
+
+    const blocked = status === 403 || status === 429 ||
+      title.includes("captcha") || title.includes("just a moment") ||
+      body.toLowerCase().includes("checking your browser");
+
+    if (blocked) return { ok: false, status: "BLOCKED", reason: `HTTP ${status}` };
+    if (status >= 400) return { ok: false, status: "ERROR", reason: `HTTP ${status}` };
+
+    const html = await page.content();
+    const fname = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}.png`;
+    const screenshotPath = path.join(SCREENSHOT_DIR, fname);
+    await page.screenshot({ path: screenshotPath, fullPage: true });
+    await ctx.close();
+    return { ok: true, status: "OK", html, screenshotPath };
+  } catch (err: any) {
+    return { ok: false, status: "ERROR", reason: err?.message || "Unknown" };
+  } finally {
+    await browser.close();
+  }
+}
+
+export function extractText(html: string, ignore?: string | null, watch?: string | null): string {
+  const $ = cheerio.load(html);
+  if (ignore) ignore.split(",").map(s => s.trim()).filter(Boolean).forEach(s => { try { $(s).remove(); } catch {} });
+
+  let raw = "";
+  if (watch) {
+    const parts: string[] = [];
+    watch.split(",").map(s => s.trim()).filter(Boolean).forEach(s => {
+     try { $(s).each((_, el) => { parts.push($(el).text()); }); } catch {}
+    });
+    raw = parts.join("\n");
+  } else raw = $("body").text();
+  return stripNoise(raw);
+}
+
+export function hashText(text: string): string {
+  return crypto.createHash("sha256").update(text).digest("hex");
+}
+
+
+===== FILE: src\ssrf.ts =====
+
+import dns from "dns/promises";
+
+const PRIVATE = [
+  /^10\./, /^127\./, /^169\.254\./, /^172\.(1[6-9]|2\d|3[01])\./,
+  /^192\.168\./, /^0\./, /^::1$/, /^fc00:/i, /^fe80:/i,
+];
+
+export async function isSafeUrl(rawUrl: string) {
+  let parsed: URL;
+  try { parsed = new URL(rawUrl); } catch { return { ok: false, reason: "Invalid URL" }; }
+  if (!["http:", "https:"].includes(parsed.protocol))
+    return { ok: false, reason: "Only http/https allowed" };
+
+  const host = parsed.hostname.toLowerCase();
+  if (host === "localhost" || host.endsWith(".local"))
+    return { ok: false, reason: "Localhost blocked" };
+
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host) && PRIVATE.some(r => r.test(host)))
+    return { ok: false, reason: "Private IP blocked" };
+
+  try {
+    const addrs = await dns.lookup(host, { all: true });
+    for (const a of addrs)
+      if (PRIVATE.some(r => r.test(a.address)))
+        return { ok: false, reason: "Resolves to private IP" };
+  } catch { return { ok: false, reason: "DNS failed" }; }
+
+  return { ok: true };
+}
+
+
+===== FILE: src\worker.ts =====
+
+import { Worker, Job } from "bullmq";
+import { CHECK_QUEUE, connection } from "./queue";
+import { prisma } from "./db";
+import { fetchPage, extractText, hashText } from "./scraper";
+import { textDiff, visualDiff } from "./differ";
+import { sendDiscord, shouldSendAlert, recordAlert } from "./alerts";
+import path from "path";
+
+const PUBLIC_DIR = path.join(process.cwd(), "public");
+const toPublicUrl = (p: string) => "/" + path.relative(PUBLIC_DIR, p).replace(/\\/g, "/");
+
+async function processUrl(job: Job<{ url: string }>) {
+  const { url } = job.data;
+  const monitors = await prisma.monitor.findMany({ where: { url } });
+  if (!monitors.length) return { skipped: true };
+
+  const scraped = await fetchPage(url);
+
+  if (!scraped.ok) {
+    await prisma.monitor.updateMany({
+      where: { url },
+      data: { status: scraped.status, lastCheckedAt: new Date() },
+    });
+    for (const m of monitors) {
+      if (m.status !== scraped.status && await shouldSendAlert(m.id, 1440)) {
+        await recordAlert(m.id, `Status â†’ ${scraped.status}`);
+        await sendDiscord(`âš ï¸ **${m.name}** â†’ ${scraped.status}`);
+      }
+    }
+    return { status: scraped.status };
+  }
+
+  const html = scraped.html!;
+  const screenshotAbs = scraped.screenshotPath!;
+
+  for (const monitor of monitors) {
+    const text = extractText(html, monitor.ignoreSelectors, monitor.watchSelectors);
+    const hash = hashText(text);
+    const lastSnap = await prisma.snapshot.findFirst({
+      where: { monitorId: monitor.id }, orderBy: { createdAt: "desc" },
+    });
+
+    if (lastSnap && lastSnap.contentHash === hash) {
+      await prisma.monitor.update({
+        where: { id: monitor.id },
+        data: { status: "OK", lastCheckedAt: new Date() },
+      });
+      continue;
+    }
+
+    if (!lastSnap) {
+      await prisma.snapshot.create({
+        data: {
+          monitorId: monitor.id, contentHash: hash,
+          textContent: text, imagePath: toPublicUrl(screenshotAbs),
+        },
+      });
+      await prisma.monitor.update({
+        where: { id: monitor.id },
+        data: { status: "OK", lastCheckedAt: new Date() },
+      });
+      continue;
+    }
+
+    const td = textDiff(lastSnap.textContent, text);
+    if (td.changeRatio * 100 < monitor.sensitivity) {
+      await prisma.monitor.update({
+        where: { id: monitor.id },
+        data: { status: "OK", lastCheckedAt: new Date() },
+      });
+      continue;
+    }
+
+    const oldAbs = path.join(PUBLIC_DIR, lastSnap.imagePath.replace(/^\//, ""));
+    const vd = await visualDiff(oldAbs, screenshotAbs);
+
+    const snapshot = await prisma.snapshot.create({
+      data: {
+        monitorId: monitor.id, contentHash: hash,
+        textContent: text, imagePath: toPublicUrl(screenshotAbs),
+        diffPath: vd ? toPublicUrl(vd.diffPath) : null,
+      },
+    });
+
+    await prisma.monitor.update({
+      where: { id: monitor.id },
+      data: { status: "OK", lastCheckedAt: new Date(), lastChangedAt: new Date() },
+    });
+
+    if (await shouldSendAlert(monitor.id, 30)) {
+      await recordAlert(monitor.id, td.summary);
+      await sendDiscord(`ðŸ”” **${monitor.name}** changed\n${td.summary}\n${monitor.url}`);
+    }
+  }
+  return { ok: true };
+}
+
+export const worker = new Worker(CHECK_QUEUE, processUrl, {
+  connection, concurrency: 3,
+  limiter: { max: 1, duration: 10_000 },
+});
+
+worker.on("completed", j => console.log(`âœ… ${j.data.url}`));
+worker.on("failed", (j, e) => console.error(`âŒ ${j?.data?.url}`, e.message));
+console.log("ðŸ‘· Worker started");
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Monitor {
+  id              String         @id @default(uuid())
+  url             String
+  name            String
+  intervalMins    Int
+  sensitivity     Int            @default(5)
+  ignoreSelectors String?
+  watchSelectors  String?
+  lastCheckedAt   DateTime?
+  lastChangedAt   DateTime?
+  status          String         @default("OK")
+  snapshots       Snapshot[]
+  alerts          Alert[]
+}
+
+model Snapshot {
+  id          String   @id @default(uuid())
+  monitorId   String
+  monitor     Monitor  @relation(fields: [monitorId], references: [id], onDelete: Cascade)
+  contentHash String
+  textContent String
+  imagePath   String
+  diffPath    String?
+  createdAt   DateTime @default(now())
+}
+
+model Alert {
+  id        String   @id @default(uuid())
+  monitorId String
+  monitor   Monitor  @relation(fields: [monitorId], references: [id], onDelete: Cascade)
+  summary   String
+  sentAt    DateTime @default(now())
+}

@@ -17,9 +17,26 @@ model Monitor {
   watchSelectors  String?
   lastCheckedAt   DateTime?
   lastChangedAt   DateTime?
+  nextCheckAt     DateTime?
   status          String         @default("OK")
+  ownerId         String?
+  owner           ApiKey?        @relation(fields: [ownerId], references: [id], onDelete: Cascade)
   snapshots       Snapshot[]
   alerts          Alert[]
+
+  @@index([nextCheckAt])
+  @@index([ownerId])
+  @@index([url])
+}
+
+model ApiKey {
+  id        String    @id @default(uuid())
+  name      String
+  keyHash   String    @unique
+  isAdmin   Boolean   @default(false)
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+  monitors  Monitor[]
 }
 
 model Snapshot {
@@ -31,6 +48,8 @@ model Snapshot {
   imagePath   String
   diffPath    String?
   createdAt   DateTime @default(now())
+
+  @@index([monitorId, createdAt])
 }
 
 model Alert {
@@ -38,5 +57,10 @@ model Alert {
   monitorId String
   monitor   Monitor  @relation(fields: [monitorId], references: [id], onDelete: Cascade)
   summary   String
+  kind      String   @default("change")
+  dedupeKey String?
   sentAt    DateTime @default(now())
+
+  @@unique([monitorId, dedupeKey])
+  @@index([monitorId, sentAt])
 }

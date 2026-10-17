@@ -1,5 +1,6 @@
 const axios = require("axios");
 const API = "http://localhost:3000";
+const KEY = "secret-demo-key-2026-super-secure";
 const h = { headers: { "x-api-key": "secret-demo-key" } };
 
 let passed = 0, failed = 0;

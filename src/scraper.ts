@@ -5,9 +5,11 @@ import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
 import { stripNoise } from "./noise";
+import { isSafeUrl, isSafeUrlCached } from "./ssrf";
+import { PUBLIC_DIR } from "./paths";
 
 chromium.use(stealth());
-const SCREENSHOT_DIR = path.join(process.cwd(), "public", "screenshots");
+const SCREENSHOT_DIR = path.join(PUBLIC_DIR, "screenshots");
 
 export interface ScrapeResult {
   ok: boolean;
@@ -18,12 +20,30 @@ export interface ScrapeResult {
 }
 
 export async function fetchPage(url: string): Promise<ScrapeResult> {
+  // Re-validate at fetch time: the URL was only checked when the monitor was
+  // created, and DNS can change after that.
+  const pre = await isSafeUrl(url);
+  if (!pre.ok) return { ok: false, status: "ERROR", reason: `Blocked by SSRF policy: ${pre.reason}` };
+
   await fs.mkdir(SCREENSHOT_DIR, { recursive: true });
   const browser = await chromium.launch({ headless: true, args: ["--no-sandbox"] });
   try {
     const ctx = await browser.newContext({
       userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
       viewport: { width: 1440, height: 900 },
+      serviceWorkers: "block", // a service worker could fetch around the route guard below
+    });
+    // Every request the page makes (the navigation, each redirect hop, iframes,
+    // XHR/fetch, images) goes through this guard, not just the first URL.
+    await ctx.route("**/*", async (route) => {
+      try {
+        const reqUrl = route.request().url();
+        if (/^(data|blob|about):/i.test(reqUrl)) return await route.continue();
+        const verdict = await isSafeUrlCached(reqUrl);
+        if (verdict.ok) return await route.continue();
+        console.warn("SSRF guard blocked", reqUrl, "-", verdict.reason);
+      } catch { /* fall through to abort */ }
+      await route.abort("blockedbyclient").catch(() => {});
     });
     const page = await ctx.newPage();
     const resp = await page.goto(url, { waitUntil: "networkidle", timeout: 30000 });
@@ -39,7 +59,7 @@ export async function fetchPage(url: string): Promise<ScrapeResult> {
     if (status >= 400) return { ok: false, status: "ERROR", reason: `HTTP ${status}` };
 
     const html = await page.content();
-    const fname = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}.png`;
+    const fname = `${Date.now()}-${crypto.randomBytes(16).toString("hex")}.png`;
     const screenshotPath = path.join(SCREENSHOT_DIR, fname);
     await page.screenshot({ path: screenshotPath, fullPage: true });
     await ctx.close();

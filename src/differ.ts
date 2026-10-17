@@ -3,8 +3,10 @@ import pixelmatch from "pixelmatch";
 import { PNG } from "pngjs";
 import fs from "fs/promises";
 import path from "path";
+import crypto from "crypto";
+import { PUBLIC_DIR } from "./paths";
 
-const DIFF_DIR = path.join(process.cwd(), "public", "diffs");
+const DIFF_DIR = path.join(PUBLIC_DIR, "diffs");
 
 export function textDiff(oldText: string, newText: string) {
   const parts = diffLines(oldText, newText);
@@ -41,7 +43,7 @@ export async function visualDiff(oldPath: string, newPath: string) {
     const diff = new PNG({ width, height });
     pixelmatch(a.data, b.data, diff.data, width, height, { threshold: 0.1 });
 
-    const diffPath = path.join(DIFF_DIR, `${Date.now()}-diff.png`);
+    const diffPath = path.join(DIFF_DIR, `${Date.now()}-${crypto.randomBytes(16).toString("hex")}-diff.png`);
     await fs.writeFile(diffPath, PNG.sync.write(diff));
     return { diffPath };
   } catch { return null; }
