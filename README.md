@@ -18,7 +18,6 @@ A production-grade backend service that monitors public web pages and alerts use
 
 ## 🏗️ Architecture
 
-```mermaid
 graph LR
     Client[Next.js Frontend] -->|REST + API Key| API[Express API]
     
