@@ -1,7 +1,8 @@
 const axios = require("axios");
+
 const API = "http://localhost:3000";
-const KEY = "secret-demo-key-2026-super-secure";
-const h = { headers: { "x-api-key": "secret-demo-key" } };
+const KEY = "secret-demo-key-2026-super-secure"; // <-- NEW KEY
+const h = { headers: { "x-api-key": KEY } };
 
 let passed = 0, failed = 0;
 const test = async (name, fn) => {
@@ -10,7 +11,7 @@ const test = async (name, fn) => {
 };
 
 (async () => {
-  console.log("🧪 Testing...\n");
+  console.log("🧪 Testing Website Change Detector...\n");
 
   await test("Health endpoint", async () => {
     const r = await axios.get(`${API}/health`);
@@ -19,14 +20,14 @@ const test = async (name, fn) => {
 
   await test("Auth blocks without key", async () => {
     try { await axios.get(`${API}/monitors`); throw new Error("should block"); }
-    catch (e) { if (e.response?.status !== 401) throw new Error("expected 401"); }
+    catch (e) { if (e.response?.status !== 401) throw new Error("expected 401, got " + e.response?.status); }
   });
 
   await test("SSRF blocks localhost", async () => {
     try {
       await axios.post(`${API}/monitors`, { url: "http://localhost:9999", name: "b", intervalMins: 15 }, h);
       throw new Error("should block");
-    } catch (e) { if (e.response?.status !== 400) throw new Error("expected 400"); }
+    } catch (e) { if (e.response?.status !== 400) throw new Error("expected 400, got " + e.response?.status); }
   });
 
   let id;
@@ -35,7 +36,7 @@ const test = async (name, fn) => {
       url: "https://example.com", name: "Example", intervalMins: 15, sensitivity: 1
     }, h);
     id = r.data.id;
-    if (!id) throw new Error("no id");
+    if (!id) throw new Error("no id returned");
   });
 
   await test("List monitors", async () => {

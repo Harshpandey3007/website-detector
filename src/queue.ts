@@ -27,3 +27,6 @@ export function enqueueCheck(url: string) {
     removeOnFail: true,
   });
 }
+const logErr = (name: string) => (err: Error) => console.error(`[${name}]`, err.message);
+connection.on("error", logErr("redis"));
+checkQueue.on("error", logErr("queue"));

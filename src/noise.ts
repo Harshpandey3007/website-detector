@@ -5,8 +5,7 @@ const PATTERNS: Array<[RegExp, string]> = [
   [/\b\d{1,2}\/\d{1,2}\/\d{2,4}\b/g, "[DATE]"],
   [/\b[a-f0-9]{32,}\b/gi, "[TOKEN]"],
   [/\b[A-Za-z0-9_-]{40,}\b/g, "[TOKEN]"],
-  [/\b\d{1,3}(,\d{3})+\b/g, "[NUM]"],
-  [/\b\d{4,}\b/g, "[NUM]"],
+  
 ];
 
 export function stripNoise(text: string): string {

@@ -1,4 +1,4 @@
-import { diffLines } from "diff";
+import { diffWordsWithSpace } from "diff";
 import pixelmatch from "pixelmatch";
 import { PNG } from "pngjs";
 import fs from "fs/promises";
@@ -9,7 +9,7 @@ import { PUBLIC_DIR } from "./paths";
 const DIFF_DIR = path.join(PUBLIC_DIR, "diffs");
 
 export function textDiff(oldText: string, newText: string) {
-  const parts = diffLines(oldText, newText);
+  const parts = diffWordsWithSpace(oldText, newText);
   let added = 0, removed = 0, unchanged = 0;
   const htmlParts: string[] = [];
   for (const p of parts) {

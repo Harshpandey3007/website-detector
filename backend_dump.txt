@@ -1,45 +1,155 @@
-﻿# BACKEND SOURCE DUMP
+# BACKEND SOURCE DUMP
 
 
+===== src\ai.ts =====
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
-===== FILE: src\alerts.ts =====
+export async function summarizeChange(oldText: string, newText: string): Promise<string | null> {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) return null;
+  try {
+    const genAI = new GoogleGenerativeAI(key);
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const prompt = `Summarize the meaningful differences between these two webpage versions in ONE sentence (max 25 words). If only noise, say "No meaningful change."\n\nOLD:\n${oldText.slice(0, 3000)}\n\nNEW:\n${newText.slice(0, 3000)}\n\nSummary:`;
+    const result = await model.generateContent(prompt);
+    return result.response.text().trim();
+  } catch (e) {
+    console.error("Gemini error:", e);
+    return null;
+  }
+}
 
+===== src\alerts.ts =====
 import axios from "axios";
+import { Prisma } from "@prisma/client";
 import { prisma } from "./db";
 
 export async function sendDiscord(content: string) {
   const webhook = process.env.DISCORD_WEBHOOK_URL;
   if (!webhook) return;
-  try { await axios.post(webhook, { content }); }
-  catch (err) { console.error("Discord failed:", err); }
+  try {
+    await axios.post(
+      webhook,
+      // monitor.name is user input: never let it ping @everyone / roles
+      { content: content.slice(0, 1900), allowed_mentions: { parse: [] } },
+      { timeout: 5_000 }, // a hung webhook must not hold a worker slot forever
+    );
+  } catch (err) { console.error("Discord failed:", (err as Error).message); }
 }
 
-export async function shouldSendAlert(monitorId: string, windowMinutes = 30): Promise<boolean> {
-  const since = new Date(Date.now() - windowMinutes * 60_000);
-  const recent = await prisma.alert.findFirst({ where: { monitorId, sentAt: { gte: since } } });
-  return !recent;
+/**
+ * Atomically claims the right to send an alert. The unique (monitorId, dedupeKey)
+ * index turns "check, then insert" into one operation, so two workers or a job
+ * retry can't both win. One alert per kind per monitor per fixed time window.
+ * Returns true if the caller should send.
+ */
+export async function claimAlert(
+  monitorId: string,
+  kind: "change" | "status",
+  summary: string,
+  windowMinutes: number,
+): Promise<boolean> {
+  const bucket = Math.floor(Date.now() / (windowMinutes * 60_000));
+  try {
+    await prisma.alert.create({ data: { monitorId, kind, summary, dedupeKey: `${kind}:${bucket}` } });
+    return true;
+  } catch (err) {
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") return false;
+    throw err;
+  }
 }
 
-export async function recordAlert(monitorId: string, summary: string) {
-  await prisma.alert.create({ data: { monitorId, summary } });
+
+===== src\auth.ts =====
+import crypto from "crypto";
+import type { NextFunction, Request, Response } from "express";
+import { prisma } from "./db";
+
+declare global {
+  // eslint-disable-next-line @typescript-eslint/no-namespace
+  namespace Express {
+    interface Request { auth?: { keyId: string; isAdmin: boolean } }
+  }
+}
+
+// Keys are stored as SHA-256 hashes, so a leaked database doesn't leak working keys.
+// Looking the hash up by its unique index also means there's no secret-dependent
+// string comparison for a timing attack to exploit.
+export const hashKey = (key: string) => crypto.createHash("sha256").update(key).digest("hex");
+
+export async function authenticate(req: Request, res: Response, next: NextFunction) {
+  const key = req.header("x-api-key");
+  if (!key) return res.status(401).json({ error: "Unauthorized" });
+  const row = await prisma.apiKey.findUnique({ where: { keyHash: hashKey(key) } });
+  if (!row || row.revokedAt) return res.status(401).json({ error: "Unauthorized" });
+  req.auth = { keyId: row.id, isAdmin: row.isAdmin };
+  next();
+}
+
+export function requireAdmin(req: Request, res: Response, next: NextFunction) {
+  if (!req.auth?.isAdmin) return res.status(403).json({ error: "Forbidden" });
+  next();
+}
+
+/** Turns the API_KEY env var into the admin key and adopts pre-existing monitors. */
+export async function bootstrapAdminKey() {
+  const raw = process.env.API_KEY;
+  if (!raw) throw new Error("API_KEY must be set"); // fail closed, never run unauthenticated
+  if (raw.length < 16 || raw === "secret-demo-key")
+    console.warn("WARNING: API_KEY is short or is the public demo key from the README. Rotate it.");
+
+  const keyHash = hashKey(raw);
+  const admin = await prisma.apiKey.upsert({
+    where: { keyHash },
+    update: { isAdmin: true, revokedAt: null },
+    create: { name: "bootstrap-admin", keyHash, isAdmin: true },
+  });
+
+  // Rotation: revoke earlier bootstrap keys and hand their monitors to the new one.
+  const old = await prisma.apiKey.findMany({
+    where: { name: "bootstrap-admin", keyHash: { not: keyHash }, revokedAt: null },
+    select: { id: true },
+  });
+  if (old.length) {
+    const ids = old.map((k) => k.id);
+    await prisma.monitor.updateMany({ where: { ownerId: { in: ids } }, data: { ownerId: admin.id } });
+    await prisma.apiKey.updateMany({ where: { id: { in: ids } }, data: { revokedAt: new Date() } });
+  }
+
+  // Monitors created before per-key ownership existed.
+  await prisma.monitor.updateMany({ where: { ownerId: null }, data: { ownerId: admin.id } });
 }
 
 
-===== FILE: src\db.ts =====
-
+===== src\db.ts =====
 import { PrismaClient } from "@prisma/client";
 export const prisma = new PrismaClient();
 
+// SQLite tuning. WAL lets readers run while the single writer writes, and
+// busy_timeout makes a blocked writer wait instead of throwing SQLITE_BUSY.
+// Both PRAGMAs are per-connection, so DATABASE_URL must include
+// ?connection_limit=1 for them to apply to every query.
+void (async () => {
+  try {
+    await prisma.$queryRawUnsafe("PRAGMA journal_mode = WAL");
+    await prisma.$queryRawUnsafe("PRAGMA busy_timeout = 5000");
+    await prisma.$queryRawUnsafe("PRAGMA synchronous = NORMAL");
+  } catch (err) {
+    console.error("SQLite PRAGMA setup failed:", err);
+  }
+})();
 
-===== FILE: src\differ.ts =====
 
+===== src\differ.ts =====
 import { diffLines } from "diff";
 import pixelmatch from "pixelmatch";
 import { PNG } from "pngjs";
 import fs from "fs/promises";
 import path from "path";
+import crypto from "crypto";
+import { PUBLIC_DIR } from "./paths";
 
-const DIFF_DIR = path.join(process.cwd(), "public", "diffs");
+const DIFF_DIR = path.join(PUBLIC_DIR, "diffs");
 
 export function textDiff(oldText: string, newText: string) {
   const parts = diffLines(oldText, newText);
@@ -76,38 +186,82 @@ export async function visualDiff(oldPath: string, newPath: string) {
     const diff = new PNG({ width, height });
     pixelmatch(a.data, b.data, diff.data, width, height, { threshold: 0.1 });
 
-    const diffPath = path.join(DIFF_DIR, `${Date.now()}-diff.png`);
+    const diffPath = path.join(DIFF_DIR, `${Date.now()}-${crypto.randomBytes(16).toString("hex")}-diff.png`);
     await fs.writeFile(diffPath, PNG.sync.write(diff));
     return { diffPath };
   } catch { return null; }
 }
 
 
-===== FILE: src\index.ts =====
+===== src\events.ts =====
+import { Response } from "express";
 
+const clients: Set<Response> = new Set();
+
+export function registerClient(res: Response) {
+  clients.add(res);
+  res.on("close", () => clients.delete(res));
+}
+
+export function broadcast(event: string, data: any) {
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const c of clients) c.write(payload);
+}
+
+===== src\index.ts =====
+import swaggerUi from "swagger-ui-express";
+import { swaggerSpec } from "./swagger";
+import { register } from "./metrics";
 import "dotenv/config";
-import express from "express";
-import path from "path";
+import "express-async-errors"; // Express 4 drops rejected promises; one bad request would crash the process
+import express, { NextFunction, Request, Response } from "express";
+import rateLimit from "express-rate-limit";
+import crypto from "crypto";
+import { z } from "zod";
 import { prisma } from "./db";
 import { isSafeUrl } from "./ssrf";
-import { checkQueue } from "./queue";
+import { enqueueCheck } from "./queue";
+import { PUBLIC_DIR } from "./paths";
+import { authenticate, bootstrapAdminKey, hashKey, requireAdmin } from "./auth";
 import "./scheduler";
 import "./worker";
+import "./shutdown";
 
-const app = express();
-app.use(express.json({ limit: "5mb" }));
-app.use("/public", express.static(path.join(process.cwd(), "public")));
-
-const OPEN = ["/health", "/"];
-app.use((req, res, next) => {
-  if (OPEN.some(p => req.path.startsWith(p))) return next();
-  if (req.header("x-api-key") !== process.env.API_KEY)
-    return res.status(401).json({ error: "Unauthorized" });
-  next();
+bootstrapAdminKey().catch((err) => {
+  console.error("FATAL: auth bootstrap failed:", err);
+  process.exit(1);
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true, uptime: process.uptime() }));
+const MAX_MONITORS_PER_KEY = Number(process.env.MAX_MONITORS_PER_KEY) || 50;
 
+const selectors = z.string().max(500).nullish();
+const createMonitorSchema = z.object({
+  url: z.string().max(2048),
+  name: z.string().trim().min(1).max(100),
+  intervalMins: z.number().int().min(15).max(1440),
+  sensitivity: z.number().int().min(0).max(100).default(5),
+  ignoreSelectors: selectors,
+  watchSelectors: selectors,
+});
+
+const app = express();
+app.set("trust proxy", 1); // Render terminates TLS in front of the app; needed for per-client rate limits
+app.use(express.json({ limit: "100kb" }));
+app.use(rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: true, legacyHeaders: false }));
+// Screenshot and diff filenames contain 128 random bits, so the URLs are unguessable.
+app.use("/public", express.static(PUBLIC_DIR));
+
+// Public routes are matched exactly. The old `OPEN.some(p => req.path.startsWith(p))`
+// treated "/" as a prefix of every path, so the API key was never actually checked.
+app.get("/health", (_req, res) => res.json({ ok: true, uptime: process.uptime() }));
+// --- Metrics Endpoint ---
+app.get("/metrics", async (_req, res) => {
+  res.set("Content-Type", register.contentType);
+  res.end(await register.metrics());
+});
+
+// --- Swagger Docs ---
+app.use("/docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 app.get("/", (_req, res) => {
   res.json({
     name: "Website Change Detector API",
@@ -124,67 +278,98 @@ app.get("/", (_req, res) => {
       "GET    /monitors/:id/history",
       "GET    /monitors/:id/compare/:v1/:v2",
       "GET    /alerts",
+      "POST   /keys (admin)",
     ],
   });
 });
 
-app.post("/monitors", async (req, res) => {
-  const { url, name, intervalMins, sensitivity, ignoreSelectors, watchSelectors } = req.body;
-  if (!url || !name || !intervalMins) return res.status(400).json({ error: "url, name, intervalMins required" });
-  if (intervalMins < 15 || intervalMins > 1440) return res.status(400).json({ error: "intervalMins must be 15â€“1440" });
+// Everything below requires a valid, non-revoked key.
+app.use(authenticate);
 
-  const safe = await isSafeUrl(url);
+const ownerId = (req: Request) => req.auth!.keyId;
+// Always look monitors up through the owner, so another key's ids are just "not found".
+const findOwned = (req: Request) =>
+  prisma.monitor.findFirst({ where: { id: req.params.id, ownerId: ownerId(req) } });
+
+app.post("/keys", requireAdmin, async (req, res) => {
+  const name = z.string().trim().min(1).max(100).safeParse(req.body?.name);
+  if (!name.success) return res.status(400).json({ error: "name required (1-100 chars)" });
+  const apiKey = "wcd_" + crypto.randomBytes(24).toString("base64url");
+  await prisma.apiKey.create({ data: { name: name.data, keyHash: hashKey(apiKey) } });
+  res.status(201).json({ name: name.data, apiKey, note: "Store this now; it cannot be shown again." });
+});
+
+app.post("/monitors", async (req, res) => {
+  const parsed = createMonitorSchema.safeParse(req.body);
+  if (!parsed.success)
+    return res.status(400).json({ error: parsed.error.issues.map(i => `${i.path.join(".") || "body"}: ${i.message}`).join("; ") });
+  const { name, intervalMins, sensitivity, ignoreSelectors, watchSelectors } = parsed.data;
+
+  const safe = await isSafeUrl(parsed.data.url);
   if (!safe.ok) return res.status(400).json({ error: safe.reason });
+  const url = new URL(parsed.data.url).href; // normalised, so equivalent spellings share one fetch
+
+  if (await prisma.monitor.count({ where: { ownerId: ownerId(req) } }) >= MAX_MONITORS_PER_KEY)
+    return res.status(403).json({ error: `Monitor limit reached (${MAX_MONITORS_PER_KEY})` });
 
   const monitor = await prisma.monitor.create({
     data: {
-      url, name, intervalMins,
-      sensitivity: sensitivity ?? 5,
+      url, name, intervalMins, sensitivity,
       ignoreSelectors: ignoreSelectors ?? null,
       watchSelectors: watchSelectors ?? null,
+      ownerId: ownerId(req),
+      nextCheckAt: new Date(Date.now() + intervalMins * 60_000), // first check is queued right below
     },
   });
 
-  await checkQueue.add("check", { url }, { jobId: url, attempts: 3 });
+  await enqueueCheck(url);
   res.status(201).json(monitor);
 });
 
-app.get("/monitors", async (_req, res) => {
-  res.json(await prisma.monitor.findMany({ orderBy: { name: "asc" } }));
+app.get("/monitors", async (req, res) => {
+  res.json(await prisma.monitor.findMany({ where: { ownerId: ownerId(req) }, orderBy: { name: "asc" } }));
 });
 
 app.get("/monitors/:id", async (req, res) => {
-  const m = await prisma.monitor.findUnique({ where: { id: req.params.id } });
+  const m = await findOwned(req);
   if (!m) return res.status(404).json({ error: "Not found" });
   res.json(m);
 });
 
 app.delete("/monitors/:id", async (req, res) => {
-  await prisma.monitor.delete({ where: { id: req.params.id } });
+  // deleteMany: a missing id returns count 0 instead of throwing P2025 (which crashed the process)
+  const { count } = await prisma.monitor.deleteMany({ where: { id: req.params.id, ownerId: ownerId(req) } });
+  if (!count) return res.status(404).json({ error: "Not found" });
   res.json({ ok: true });
 });
 
 app.post("/monitors/:id/check", async (req, res) => {
-  const m = await prisma.monitor.findUnique({ where: { id: req.params.id } });
+  const m = await findOwned(req);
   if (!m) return res.status(404).json({ error: "Not found" });
-  await checkQueue.add("check", { url: m.url }, { jobId: m.url, attempts: 3 });
+  await enqueueCheck(m.url);
   res.json({ queued: true });
 });
 
 app.get("/monitors/:id/history", async (req, res) => {
+  const m = await findOwned(req);
+  if (!m) return res.status(404).json({ error: "Not found" });
   const snaps = await prisma.snapshot.findMany({
-    where: { monitorId: req.params.id },
+    where: { monitorId: m.id },
     orderBy: { createdAt: "desc" },
+    take: 200,
     select: { id: true, contentHash: true, imagePath: true, diffPath: true, createdAt: true },
   });
   res.json(snaps);
 });
 
 app.get("/monitors/:id/compare/:v1/:v2", async (req, res) => {
+  const m = await findOwned(req);
+  if (!m) return res.status(404).json({ error: "Not found" });
   const { v1, v2 } = req.params;
+  // Both snapshots must belong to THIS monitor (the old code ignored :id entirely).
   const [a, b] = await Promise.all([
-    prisma.snapshot.findUnique({ where: { id: v1 } }),
-    prisma.snapshot.findUnique({ where: { id: v2 } }),
+    prisma.snapshot.findFirst({ where: { id: v1, monitorId: m.id } }),
+    prisma.snapshot.findFirst({ where: { id: v2, monitorId: m.id } }),
   ]);
   if (!a || !b) return res.status(404).json({ error: "Snapshot not found" });
 
@@ -199,20 +384,48 @@ app.get("/monitors/:id/compare/:v1/:v2", async (req, res) => {
   });
 });
 
-app.get("/alerts", async (_req, res) => {
+app.get("/alerts", async (req, res) => {
   const alerts = await prisma.alert.findMany({
+    where: { monitor: { ownerId: ownerId(req) } },
     orderBy: { sentAt: "desc" }, take: 100,
     include: { monitor: { select: { name: true, url: true } } },
   });
   res.json(alerts);
 });
 
+app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+  const status = Number(err?.status ?? err?.statusCode) || 500;
+  if (status >= 500) console.error(err);
+  res.status(status).json({ error: status >= 500 ? "Internal error" : String(err.message) });
+});
+
 const PORT = Number(process.env.PORT) || 3000;
-app.listen(PORT, () => console.log(`ðŸš€ API on http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`🚀 API on http://localhost:${PORT}`));
 
 
-===== FILE: src\noise.ts =====
+===== src\metrics.ts =====
+import client from "prom-client";
+client.collectDefaultMetrics();
 
+export const jobsProcessed = new client.Counter({
+  name: "checks_processed_total",
+  help: "Total checks processed",
+  labelNames: ["status"],
+});
+
+export const changesDetected = new client.Counter({
+  name: "changes_detected_total",
+  help: "Total changes detected",
+});
+
+export const alertsSent = new client.Counter({
+  name: "alerts_sent_total",
+  help: "Total alerts sent",
+});
+
+export const register = client.register;
+
+===== src\noise.ts =====
 const PATTERNS: Array<[RegExp, string]> = [
   [/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?/g, "[TS]"],
   [/\b\d{1,2}:\d{2}(:\d{2})?\s?(AM|PM|am|pm)?\b/g, "[TIME]"],
@@ -231,10 +444,18 @@ export function stripNoise(text: string): string {
 }
 
 
-===== FILE: src\queue.ts =====
+===== src\paths.ts =====
+import path from "path";
 
+// Everything the app writes to disk (screenshots, diffs) lives under here.
+// On Render, point this at the persistent disk, e.g. PUBLIC_DIR=/var/data/public
+export const PUBLIC_DIR = process.env.PUBLIC_DIR || path.join(process.cwd(), "public");
+
+
+===== src\queue.ts =====
 import { Queue, QueueEvents } from "bullmq";
 import IORedis from "ioredis";
+import { createHash } from "crypto";
 
 export const connection = new IORedis(process.env.REDIS_URL || "redis://127.0.0.1:6379", {
   maxRetriesPerRequest: null,
@@ -244,40 +465,73 @@ export const CHECK_QUEUE = "check-queue";
 export const checkQueue = new Queue(CHECK_QUEUE, { connection });
 export const queueEvents = new QueueEvents(CHECK_QUEUE, { connection });
 
+// BullMQ silently ignores add() when a job with the same id still exists in ANY
+// state (waiting, active, delayed, completed, failed). So:
+//  - the id must be deterministic, which is what dedupes "200 users, 1 URL";
+//  - finished jobs must delete themselves, or that URL can never be queued again;
+//  - the id can't be the raw URL, because BullMQ rejects ":" in custom ids.
+export const checkJobId = (url: string) =>
+  "check-" + createHash("sha1").update(url).digest("hex");
 
-===== FILE: src\scheduler.ts =====
+export function enqueueCheck(url: string) {
+  return checkQueue.add("check", { url }, {
+    jobId: checkJobId(url),
+    attempts: 3,
+    backoff: { type: "exponential", delay: 30_000 },
+    removeOnComplete: true,
+    removeOnFail: true,
+  });
+}
 
+
+===== src\scheduler.ts =====
 import cron from "node-cron";
 import { prisma } from "./db";
-import { checkQueue } from "./queue";
+import { enqueueCheck } from "./queue";
+
+let running = false; // node-cron starts the next tick even if the last one is still running
 
 cron.schedule("* * * * *", async () => {
+  if (running) return;
+  running = true;
   try {
     const now = new Date();
-    const monitors = await prisma.monitor.findMany();
-    const due = new Set<string>();
+    const isDue = { OR: [{ nextCheckAt: null }, { nextCheckAt: { lte: now } }] };
 
-    for (const m of monitors) {
-      if (!m.lastCheckedAt) { due.add(m.url); continue; }
-      if (new Date(m.lastCheckedAt.getTime() + m.intervalMins * 60_000) <= now) due.add(m.url);
-    }
+    const due = await prisma.monitor.findMany({
+      where: isDue,
+      select: { id: true, url: true, intervalMins: true },
+    });
 
-    for (const url of due) {
-      await checkQueue.add("check", { url }, {
-        jobId: url, attempts: 3,
-        backoff: { type: "exponential", delay: 30_000 },
-        removeOnComplete: true,
+    // Claim each monitor with a compare-and-set: the UPDATE only matches while the
+    // monitor is still due, so if two ticks (or two instances) race, exactly one
+    // gets count === 1 and the other skips it.
+    const claimed = new Map<string, string[]>(); // url -> claimed monitor ids
+    for (const m of due) {
+      const res = await prisma.monitor.updateMany({
+        where: { id: m.id, ...isDue },
+        data: { nextCheckAt: new Date(now.getTime() + m.intervalMins * 60_000) },
       });
+      if (res.count === 1) claimed.set(m.url, [...(claimed.get(m.url) ?? []), m.id]);
     }
-    if (due.size) console.log(`â± Scheduled ${due.size} URLs`);
+
+    for (const [url, ids] of claimed) {
+      try {
+        await enqueueCheck(url); // one job per URL, however many monitors share it
+      } catch (err) {
+        console.error("Enqueue failed, retrying next tick:", url, err);
+        await prisma.monitor.updateMany({ where: { id: { in: ids } }, data: { nextCheckAt: now } });
+      }
+    }
+    if (claimed.size) console.log(`⏱ Scheduled ${claimed.size} URLs`);
   } catch (err) { console.error("Scheduler:", err); }
+  finally { running = false; }
 });
 
-console.log("â° Scheduler started");
+console.log("⏰ Scheduler started");
 
 
-===== FILE: src\scraper.ts =====
-
+===== src\scraper.ts =====
 import { chromium } from "playwright-extra";
 import stealth from "puppeteer-extra-plugin-stealth";
 import * as cheerio from "cheerio";
@@ -285,9 +539,11 @@ import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
 import { stripNoise } from "./noise";
+import { isSafeUrl, isSafeUrlCached } from "./ssrf";
+import { PUBLIC_DIR } from "./paths";
 
 chromium.use(stealth());
-const SCREENSHOT_DIR = path.join(process.cwd(), "public", "screenshots");
+const SCREENSHOT_DIR = path.join(PUBLIC_DIR, "screenshots");
 
 export interface ScrapeResult {
   ok: boolean;
@@ -298,12 +554,30 @@ export interface ScrapeResult {
 }
 
 export async function fetchPage(url: string): Promise<ScrapeResult> {
+  // Re-validate at fetch time: the URL was only checked when the monitor was
+  // created, and DNS can change after that.
+  const pre = await isSafeUrl(url);
+  if (!pre.ok) return { ok: false, status: "ERROR", reason: `Blocked by SSRF policy: ${pre.reason}` };
+
   await fs.mkdir(SCREENSHOT_DIR, { recursive: true });
   const browser = await chromium.launch({ headless: true, args: ["--no-sandbox"] });
   try {
     const ctx = await browser.newContext({
       userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
       viewport: { width: 1440, height: 900 },
+      serviceWorkers: "block", // a service worker could fetch around the route guard below
+    });
+    // Every request the page makes (the navigation, each redirect hop, iframes,
+    // XHR/fetch, images) goes through this guard, not just the first URL.
+    await ctx.route("**/*", async (route) => {
+      try {
+        const reqUrl = route.request().url();
+        if (/^(data|blob|about):/i.test(reqUrl)) return await route.continue();
+        const verdict = await isSafeUrlCached(reqUrl);
+        if (verdict.ok) return await route.continue();
+        console.warn("SSRF guard blocked", reqUrl, "-", verdict.reason);
+      } catch { /* fall through to abort */ }
+      await route.abort("blockedbyclient").catch(() => {});
     });
     const page = await ctx.newPage();
     const resp = await page.goto(url, { waitUntil: "networkidle", timeout: 30000 });
@@ -319,7 +593,7 @@ export async function fetchPage(url: string): Promise<ScrapeResult> {
     if (status >= 400) return { ok: false, status: "ERROR", reason: `HTTP ${status}` };
 
     const html = await page.content();
-    const fname = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}.png`;
+    const fname = `${Date.now()}-${crypto.randomBytes(16).toString("hex")}.png`;
     const screenshotPath = path.join(SCREENSHOT_DIR, fname);
     await page.screenshot({ path: screenshotPath, fullPage: true });
     await ctx.close();
@@ -351,47 +625,135 @@ export function hashText(text: string): string {
 }
 
 
-===== FILE: src\ssrf.ts =====
+===== src\shutdown.ts =====
+import { worker } from "./worker";
+import { checkQueue, queueEvents, connection } from "./queue";
+import { prisma } from "./db";
 
-import dns from "dns/promises";
+let closing = false;
 
-const PRIVATE = [
-  /^10\./, /^127\./, /^169\.254\./, /^172\.(1[6-9]|2\d|3[01])\./,
-  /^192\.168\./, /^0\./, /^::1$/, /^fc00:/i, /^fe80:/i,
+async function shutdown(signal: string) {
+  if (closing) return;
+  closing = true;
+  console.log(`${signal} received, shutting down`);
+  const force = setTimeout(() => process.exit(1), 25_000); // Render allows ~30s after SIGTERM
+  force.unref();
+  try {
+    await worker.close(); // lets the job that is running finish
+    await queueEvents.close();
+    await checkQueue.close();
+    await connection.quit();
+    await prisma.$disconnect();
+  } catch (err) {
+    console.error("Shutdown error:", err);
+  } finally {
+    process.exit(0);
+  }
+}
+
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));
+// Safety net only: express-async-errors is what keeps request handlers from reaching this.
+process.on("unhandledRejection", (reason) => console.error("unhandledRejection:", reason));
+
+
+===== src\ssrf.ts =====
+import dns from "node:dns/promises";
+import net from "node:net";
+
+export type UrlVerdict = { ok: true } | { ok: false; reason: string };
+
+// Every range that is not a normal public unicast address. net.BlockList also
+// matches IPv4-mapped IPv6 (::ffff:10.0.0.1) against the IPv4 rules.
+const blocked = new net.BlockList();
+const V4: Array<[string, number]> = [
+  ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8],
+  ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.0.2.0", 24],
+  ["192.88.99.0", 24], ["192.168.0.0", 16], ["198.18.0.0", 15], ["198.51.100.0", 24],
+  ["203.0.113.0", 24], ["224.0.0.0", 4], ["240.0.0.0", 4],
 ];
+const V6: Array<[string, number]> = [
+  ["::", 128], ["::1", 128], ["64:ff9b::", 96], ["64:ff9b:1::", 48], ["100::", 64],
+  ["2001::", 23], ["2001:db8::", 32], ["2002::", 16], ["fc00::", 7], ["fe80::", 10], ["ff00::", 8],
+];
+for (const [addr, prefix] of V4) blocked.addSubnet(addr, prefix, "ipv4");
+for (const [addr, prefix] of V6) blocked.addSubnet(addr, prefix, "ipv6");
 
-export async function isSafeUrl(rawUrl: string) {
+export function isPublicIp(address: string): boolean {
+  const family = net.isIP(address);
+  if (family === 0) return false;
+  return !blocked.check(address, family === 6 ? "ipv6" : "ipv4");
+}
+
+const BLOCKED_SUFFIXES = [".localhost", ".local", ".internal", ".lan", ".home.arpa"];
+const ALLOWED_PORTS = new Set(["", "80", "443"]); // URL.port is "" for the default port
+
+export async function isSafeUrl(rawUrl: string): Promise<UrlVerdict> {
   let parsed: URL;
   try { parsed = new URL(rawUrl); } catch { return { ok: false, reason: "Invalid URL" }; }
   if (!["http:", "https:"].includes(parsed.protocol))
     return { ok: false, reason: "Only http/https allowed" };
+  if (parsed.username || parsed.password)
+    return { ok: false, reason: "Credentials in URL not allowed" };
+  if (!ALLOWED_PORTS.has(parsed.port))
+    return { ok: false, reason: "Only ports 80 and 443 are allowed" };
 
-  const host = parsed.hostname.toLowerCase();
-  if (host === "localhost" || host.endsWith(".local"))
+  // WHATWG URL keeps the brackets on IPv6 literals ("[::1]") and normalises
+  // decimal/hex/octal IPv4 forms ("2130706433" -> "127.0.0.1").
+  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (host === "localhost" || BLOCKED_SUFFIXES.some((s) => host.endsWith(s)))
     return { ok: false, reason: "Localhost blocked" };
 
-  if (/^\d+\.\d+\.\d+\.\d+$/.test(host) && PRIVATE.some(r => r.test(host)))
-    return { ok: false, reason: "Private IP blocked" };
+  if (net.isIP(host))
+    return isPublicIp(host) ? { ok: true } : { ok: false, reason: "Private IP blocked" };
 
   try {
-    const addrs = await dns.lookup(host, { all: true });
-    for (const a of addrs)
-      if (PRIVATE.some(r => r.test(a.address)))
-        return { ok: false, reason: "Resolves to private IP" };
+    const addrs = await dns.lookup(host, { all: true, verbatim: true });
+    if (!addrs.length || addrs.some((a) => !isPublicIp(a.address)))
+      return { ok: false, reason: "Resolves to a non-public IP" };
   } catch { return { ok: false, reason: "DNS failed" }; }
 
   return { ok: true };
 }
 
+// A page makes hundreds of requests; cache verdicts per host so the browser
+// request guard doesn't do a DNS lookup for every image.
+const CACHE_TTL_MS = 30_000;
+const cache = new Map<string, { verdict: UrlVerdict; expires: number }>();
 
-===== FILE: src\worker.ts =====
+export async function isSafeUrlCached(rawUrl: string): Promise<UrlVerdict> {
+  let key: string;
+  try { const u = new URL(rawUrl); key = `${u.protocol}//${u.host}`; }
+  catch { return { ok: false, reason: "Invalid URL" }; }
+  const hit = cache.get(key);
+  if (hit && hit.expires > Date.now()) return hit.verdict;
+  const verdict = await isSafeUrl(rawUrl);
+  if (cache.size > 5_000) cache.clear();
+  cache.set(key, { verdict, expires: Date.now() + CACHE_TTL_MS });
+  return verdict;
+}
 
+
+===== src\swagger.ts =====
+import swaggerJsdoc from "swagger-jsdoc";
+
+export const swaggerSpec = swaggerJsdoc({
+  definition: {
+    openapi: "3.0.0",
+    info: { title: "Website Change Detector API", version: "1.0.0" },
+    servers: [{ url: "http://localhost:3000" }],
+  },
+  apis: ["./src/index.ts"],
+});
+
+===== src\worker.ts =====
 import { Worker, Job } from "bullmq";
 import { CHECK_QUEUE, connection } from "./queue";
 import { prisma } from "./db";
 import { fetchPage, extractText, hashText } from "./scraper";
 import { textDiff, visualDiff } from "./differ";
-import { sendDiscord, shouldSendAlert, recordAlert } from "./alerts";
+import { summarizeChange } from "./ai";
+import { sendDiscord, claimAlert } from "./alerts";
 import path from "path";
 
 const PUBLIC_DIR = path.join(process.cwd(), "public");
@@ -410,9 +772,8 @@ async function processUrl(job: Job<{ url: string }>) {
       data: { status: scraped.status, lastCheckedAt: new Date() },
     });
     for (const m of monitors) {
-      if (m.status !== scraped.status && await shouldSendAlert(m.id, 1440)) {
-        await recordAlert(m.id, `Status â†’ ${scraped.status}`);
-        await sendDiscord(`âš ï¸ **${m.name}** â†’ ${scraped.status}`);
+      if (m.status !== scraped.status && await claimAlert(m.id, "status", `Status: ${scraped.status}`, 1440)) {
+        await sendDiscord(`⚠️ **${m.name}** → ${scraped.status}`);
       }
     }
     return { status: scraped.status };
@@ -420,77 +781,92 @@ async function processUrl(job: Job<{ url: string }>) {
 
   const html = scraped.html!;
   const screenshotAbs = scraped.screenshotPath!;
+  let keepScreenshot = false; // only a stored snapshot references the file
 
   for (const monitor of monitors) {
-    const text = extractText(html, monitor.ignoreSelectors, monitor.watchSelectors);
-    const hash = hashText(text);
-    const lastSnap = await prisma.snapshot.findFirst({
-      where: { monitorId: monitor.id }, orderBy: { createdAt: "desc" },
-    });
-
-    if (lastSnap && lastSnap.contentHash === hash) {
-      await prisma.monitor.update({
-        where: { id: monitor.id },
-        data: { status: "OK", lastCheckedAt: new Date() },
+    try {
+      const text = extractText(html, monitor.ignoreSelectors, monitor.watchSelectors);
+      const hash = hashText(text);
+      const lastSnap = await prisma.snapshot.findFirst({
+        where: { monitorId: monitor.id }, orderBy: { createdAt: "desc" },
       });
-      continue;
-    }
 
-    if (!lastSnap) {
-      await prisma.snapshot.create({
+      if (lastSnap && lastSnap.contentHash === hash) {
+        await prisma.monitor.update({
+          where: { id: monitor.id },
+          data: { status: "OK", lastCheckedAt: new Date() },
+        });
+        continue;
+      }
+
+      if (!lastSnap) {
+        keepScreenshot = true;
+        await prisma.snapshot.create({
+          data: {
+            monitorId: monitor.id, contentHash: hash,
+            textContent: text, imagePath: toPublicUrl(screenshotAbs),
+          },
+        });
+        await prisma.monitor.update({
+          where: { id: monitor.id },
+          data: { status: "OK", lastCheckedAt: new Date() },
+        });
+        continue;
+      }
+
+      const td = textDiff(lastSnap.textContent, text);
+      if (td.changeRatio * 100 < monitor.sensitivity) {
+        await prisma.monitor.update({
+          where: { id: monitor.id },
+          data: { status: "OK", lastCheckedAt: new Date() },
+        });
+        continue;
+      }
+
+      keepScreenshot = true;
+      const oldAbs = path.join(PUBLIC_DIR, lastSnap.imagePath.replace(/^\//, ""));
+      const vd = await visualDiff(oldAbs, screenshotAbs);
+      const aiSummary = await summarizeChange(lastSnap.textContent, text);
+      const finalSummary = aiSummary || td.summary;
+
+      const snapshot = await prisma.snapshot.create({
         data: {
           monitorId: monitor.id, contentHash: hash,
           textContent: text, imagePath: toPublicUrl(screenshotAbs),
+          diffPath: vd ? toPublicUrl(vd.diffPath) : null,
         },
       });
+
       await prisma.monitor.update({
         where: { id: monitor.id },
-        data: { status: "OK", lastCheckedAt: new Date() },
+        data: { status: "OK", lastCheckedAt: new Date(), lastChangedAt: new Date() },
       });
-      continue;
-    }
 
-    const td = textDiff(lastSnap.textContent, text);
-    if (td.changeRatio * 100 < monitor.sensitivity) {
-      await prisma.monitor.update({
-        where: { id: monitor.id },
-        data: { status: "OK", lastCheckedAt: new Date() },
-      });
-      continue;
-    }
-
-    const oldAbs = path.join(PUBLIC_DIR, lastSnap.imagePath.replace(/^\//, ""));
-    const vd = await visualDiff(oldAbs, screenshotAbs);
-
-    const snapshot = await prisma.snapshot.create({
-      data: {
-        monitorId: monitor.id, contentHash: hash,
-        textContent: text, imagePath: toPublicUrl(screenshotAbs),
-        diffPath: vd ? toPublicUrl(vd.diffPath) : null,
-      },
-    });
-
-    await prisma.monitor.update({
-      where: { id: monitor.id },
-      data: { status: "OK", lastCheckedAt: new Date(), lastChangedAt: new Date() },
-    });
-
-    if (await shouldSendAlert(monitor.id, 30)) {
-      await recordAlert(monitor.id, td.summary);
-      await sendDiscord(`ðŸ”” **${monitor.name}** changed\n${td.summary}\n${monitor.url}`);
+      if (await claimAlert(monitor.id, "change", finalSummary, 30)) {
+        await sendDiscord(`🔔 **${monitor.name}** changed\n${finalSummary}\n${monitor.url}`);
+      }
+    } catch (err: any) {
+      // P2003 means Foreign Key constraint failed (monitor was deleted while fetching)
+      if (err.code === 'P2003') {
+        console.log(`⚠️ Monitor ${monitor.id} was deleted during fetch. Skipping.`);
+      } else {
+        throw err;
+      }
     }
   }
   return { ok: true };
 }
 
 export const worker = new Worker(CHECK_QUEUE, processUrl, {
-  connection, concurrency: 3,
+  connection, concurrency: 1, // Claude set this to 1 to prevent OOM on Render
   limiter: { max: 1, duration: 10_000 },
 });
 
-worker.on("completed", j => console.log(`âœ… ${j.data.url}`));
-worker.on("failed", (j, e) => console.error(`âŒ ${j?.data?.url}`, e.message));
-console.log("ðŸ‘· Worker started");
+worker.on("completed", j => console.log(`✅ ${j.data.url}`));
+worker.on("failed", (j, e) => console.error(`❌ ${j?.data?.url}`, e.message));
+console.log("👷 Worker started");
+
+===== prisma\schema.prisma =====
 generator client {
   provider = "prisma-client-js"
 }
@@ -510,9 +886,26 @@ model Monitor {
   watchSelectors  String?
   lastCheckedAt   DateTime?
   lastChangedAt   DateTime?
+  nextCheckAt     DateTime?
   status          String         @default("OK")
+  ownerId         String?
+  owner           ApiKey?        @relation(fields: [ownerId], references: [id], onDelete: Cascade)
   snapshots       Snapshot[]
   alerts          Alert[]
+
+  @@index([nextCheckAt])
+  @@index([ownerId])
+  @@index([url])
+}
+
+model ApiKey {
+  id        String    @id @default(uuid())
+  name      String
+  keyHash   String    @unique
+  isAdmin   Boolean   @default(false)
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+  monitors  Monitor[]
 }
 
 model Snapshot {
@@ -524,6 +917,8 @@ model Snapshot {
   imagePath   String
   diffPath    String?
   createdAt   DateTime @default(now())
+
+  @@index([monitorId, createdAt])
 }
 
 model Alert {
@@ -531,5 +926,10 @@ model Alert {
   monitorId String
   monitor   Monitor  @relation(fields: [monitorId], references: [id], onDelete: Cascade)
   summary   String
+  kind      String   @default("change")
+  dedupeKey String?
   sentAt    DateTime @default(now())
+
+  @@unique([monitorId, dedupeKey])
+  @@index([monitorId, sentAt])
 }

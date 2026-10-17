@@ -1,3 +1,6 @@
+import { PUBLIC_DIR } from "./paths";
+import { jobsProcessed, changesDetected, alertsSent } from "./metrics";
+import fs from "fs/promises";
 import { Worker, Job } from "bullmq";
 import { CHECK_QUEUE, connection } from "./queue";
 import { prisma } from "./db";
@@ -7,7 +10,7 @@ import { summarizeChange } from "./ai";
 import { sendDiscord, claimAlert } from "./alerts";
 import path from "path";
 
-const PUBLIC_DIR = path.join(process.cwd(), "public");
+
 const toPublicUrl = (p: string) => "/" + path.relative(PUBLIC_DIR, p).replace(/\\/g, "/");
 
 async function processUrl(job: Job<{ url: string }>) {
@@ -48,6 +51,7 @@ async function processUrl(job: Job<{ url: string }>) {
           data: { status: "OK", lastCheckedAt: new Date() },
         });
         continue;
+        jobsProcessed.inc({ status: "OK" });
       }
 
       if (!lastSnap) {
@@ -63,6 +67,7 @@ async function processUrl(job: Job<{ url: string }>) {
           data: { status: "OK", lastCheckedAt: new Date() },
         });
         continue;
+        jobsProcessed.inc({ status: "OK" });
       }
 
       const td = textDiff(lastSnap.textContent, text);
@@ -72,6 +77,7 @@ async function processUrl(job: Job<{ url: string }>) {
           data: { status: "OK", lastCheckedAt: new Date() },
         });
         continue;
+        jobsProcessed.inc({ status: "OK" });
       }
 
       keepScreenshot = true;
@@ -105,7 +111,11 @@ async function processUrl(job: Job<{ url: string }>) {
       }
     }
   }
+    if (!keepScreenshot) {
+    await fs.unlink(screenshotAbs).catch(() => {});
+  }
   return { ok: true };
+  
 }
 
 export const worker = new Worker(CHECK_QUEUE, processUrl, {
@@ -116,3 +126,4 @@ export const worker = new Worker(CHECK_QUEUE, processUrl, {
 worker.on("completed", j => console.log(`✅ ${j.data.url}`));
 worker.on("failed", (j, e) => console.error(`❌ ${j?.data?.url}`, e.message));
 console.log("👷 Worker started");
+worker.on("error", (e) => console.error("[worker]", e.message));
