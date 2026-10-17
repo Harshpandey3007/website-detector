@@ -7,10 +7,12 @@
 ![Playwright](https://img.shields.io/badge/Playwright-1.47-green)
 
 
+
 **Frontend Source Code:** [https://github.com/Harshpandey3007/website-detector-frontend](https://github.com/Harshpandey3007/website-detector-frontend)
 **Backend API URL:** https://website-detector-151j.onrender.com
 **Swagger API Docs:** https://website-detector-151j.onrender.com/docs
 **Prometheus Metrics:** https://website-detector-151j.onrender.com/metrics
+
 
 A production-grade backend service that monitors public web pages and alerts users to **meaningful changes** while intelligently ignoring noise. 
 
@@ -30,7 +32,7 @@ graph LR
     Worker -->|AI Summary| Gemini[Google Gemini AI]
     
     Engine -->|Save Snapshot| DB
-    Engine -->|Trigger Alert| Alerts[Discord / Email]
+    Engine -->|Trigger Alert| Alerts["Discord / Email"]
 ✨ Key Features
 🎭 Headless Browser Rendering: Uses Playwright + Stealth to accurately capture JavaScript-heavy pages.
 
@@ -76,4 +78,5 @@ Data Isolation: Monitors are scoped to the API Key that created them.
 
 📄 License
 MIT
+
 
