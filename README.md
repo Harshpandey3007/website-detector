@@ -1,107 +1,109 @@
-﻿# 🌐 Website Change Detector
-**Live Demo:** https://website-detector-151j.onrender.com/
-A backend service that monitors public web pages and alerts users to meaningful changes while ignoring noise.
+﻿# 🌐 Aegis Watch — Website Change Detector
 
-## Features
+**Live Demo (Frontend):** [website-detector-amq4.vercel.app]
+**Backend API:** [https://website-detector-151j.onrender.com]
+**Swagger API Docs:** https://website-detector-151j.onrender.com/docs
+**Prometheus Metrics:** https://website-detector-151j.onrender.com/metrics
 
-- Headless browser rendering (Playwright + stealth)
-- Configurable intervals (15 min - 24 hours)
-- Noise filtering (timestamps, counters, random tokens)
-- CSS selector watch/ignore support
-- Text + visual diffing (pixelmatch)
-- Discord alerts with deduplication
-- URL deduplication (200 users on 1 URL -> 1 fetch)
-- Rate limiting
-- SSRF protection (blocks localhost, private IPs)
-- Retries with exponential backoff (BullMQ)
-- Status tracking (OK / ERROR / BLOCKED - CAPTCHA handled)
+A production-grade, full-stack application that monitors public web pages and alerts users to **meaningful changes** while intelligently ignoring noise. 
 
-## Tech Stack
 
-- Node.js 20 + TypeScript
-- Express 4
-- SQLite + Prisma 5
-- BullMQ + Redis (Upstash)
-- Playwright + Stealth plugin
-- diff (text) + pixelmatch (visual)
+---
 
-## Setup
+## ✨ Key Features
 
-### Prerequisites
-- Node.js v20.x
-- Redis (Upstash free tier)
+- 🎭 **Headless Browser Rendering:** Uses Playwright + Stealth to accurately capture JavaScript-heavy pages.
+- 🧠 **AI Change Summaries:** Integrates Google Gemini 1.5 Flash to generate human-readable, one-sentence summaries of what actually changed.
+- 🔇 **Noise Filtering:** Strips timestamps, counters, and random tokens before hashing to prevent false alarms.
+- 📸 **Visual & Text Diffing:** Side-by-side pixel comparison (via `pixelmatch`) alongside text diffs.
+- ⚡ **URL Deduplication:** If 200 users monitor the same URL, it is fetched only once via BullMQ job deduplication.
+- 🚦 **Rate Limiting & Jitter:** Prevents hammering target sites.
+- 🔒 **Security Hardened:** SSRF protection (blocks internal IPs), SHA-256 hashed API keys, IDOR protection.
+- 📊 **Observability:** Prometheus metrics and interactive Swagger API documentation.
 
-### Install
-    npm install
-    npx playwright install chromium
+---
 
-### Configure .env
-    PORT=3000
-    REDIS_URL=rediss://default:PASSWORD@your-db.upstash.io:6379
-    DATABASE_URL="file:./dev.db"
-    API_KEY=secret-demo-key
-    DISCORD_WEBHOOK_URL=
+## 🏗️ Architecture
 
-### Migrate DB
-    npx prisma migrate dev --name init
+```mermaid
+graph LR
+    A[Next.js Frontend] -->|REST + API Key| B[Express API]
+    B -->|enqueue| C[(Redis + BullMQ)]
+    C -->|jobs| D[Playwright Worker]
+    D -->|fetch| E[Target Websites]
+    D -->|diff + AI| F[(SQLite + Prisma)]
+    D -->|alert| G[Discord Webhook]
+🧪 Test Script (Backend)
+To verify the backend implementation and security (as required by the hackathon), run the integration test suite:
 
-### Run
-    npm run dev
+bash
+# Terminal 1: Start the backend server
+cd backend
+npm run dev
 
-### Test
-    node test.js
+# Terminal 2: Run the test script
+node test.js
+Expected Output: 📊 8 passed, 0 failed
+(Tests include: Auth blocking, SSRF protection, CRUD operations, and queue triggering).
 
-## API Endpoints
+🛠️ Tech Stack
+Frontend:
 
-All require x-api-key: secret-demo-key header (except /health).
+Next.js 14 (App Router)
 
-| Method | Endpoint | Purpose |
-|---|---|---|
-| GET | /health | Health check |
-| POST | /monitors | Create monitor |
-| GET | /monitors | List monitors |
-| GET | /monitors/:id | Get monitor |
-| DELETE | /monitors/:id | Delete monitor |
-| POST | /monitors/:id/check | Manual check |
-| GET | /monitors/:id/history | Snapshot timeline |
-| GET | /monitors/:id/compare/:v1/:v2 | Side-by-side diff |
-| GET | /alerts | Recent alerts |
+TypeScript & Tailwind CSS
 
-### Example: Create Monitor
+Lucide React (Icons) & React Hot Toast
 
-    curl -X POST http://localhost:3000/monitors \
-      -H "Content-Type: application/json" \
-      -H "x-api-key: secret-demo-key" \
-      -d '{"url":"https://example.com","name":"Example","intervalMins":15,"sensitivity":5}'
+Backend:
 
-## How It Works
+Node.js 20 & Express
 
-1. Scheduler runs every minute, finds due monitors, queues jobs (one per URL - deduplication)
-2. Worker picks up jobs, renders pages with Playwright, extracts text, hashes
-3. Noise Filter strips timestamps/counters/tokens before hashing
-4. Diff Engine compares old vs new text + screenshots if hash changed
-5. Alerts sent via Discord, deduplicated within 30-min window
-6. Status = BLOCKED on CAPTCHA, ERROR on failure (no false alerts)
+Prisma ORM + SQLite
 
-## Security
+BullMQ + Redis (Upstash)
 
-- SSRF protection blocks localhost, private IPs, AWS metadata
-- Only http/https protocols allowed
-- API key required
-- No credential storage - public pages only
+Playwright + playwright-extra
 
-## Test Script
+Google Gemini API
 
-Run the server in one terminal:
+🚀 Local Setup
+1. Backend Setup
+bash
+git clone [Insert Backend Repo URL]
+cd backend
+npm install
+npx playwright install chromium
+npx prisma migrate dev --name init
+Create a .env file:
 
-    npm run dev
+env
+PORT=3000
+DATABASE_URL="file:./dev.db"
+REDIS_URL=rediss://default:YOUR_PASSWORD@your-db.upstash.io:6379
+API_KEY=your-super-secure-api-key-min-16-chars
+GEMINI_API_KEY=your-gemini-api-key
+DISCORD_WEBHOOK_URL=your-discord-webhook
+Start the backend: npm run dev
 
-Run the test script in another:
+2. Frontend Setup
+bash
+git clone [https://github.com/Harshpandey3007/website-detector]
+cd frontend
+npm install
+Create a .env.local file:
 
-    node test.js
+env
+NEXT_PUBLIC_API_URL=http://localhost:3000
+NEXT_PUBLIC_API_KEY=your-super-secure-api-key-min-16-chars
+Start the frontend: npm run dev
 
-Expected: 8 passed, 0 failed
+🔒 Security Design Decisions
+SSRF Protection: Uses net.BlockList to resolve DNS and block private IP ranges (10.x, 192.168.x, etc.), preventing the scraper from hitting internal infrastructure.
 
-## License
+API Key Auth: Keys are hashed with SHA-256 before being stored in the database. Keys are validated using an indexed lookup to prevent timing attacks.
 
+Data Isolation: Monitors are scoped to the ownerId (API Key ID) that created them, preventing Insecure Direct Object Reference (IDOR) vulnerabilities.
+
+📄 License
 MIT
