@@ -26,7 +26,17 @@ export async function fetchPage(url: string): Promise<ScrapeResult> {
   if (!pre.ok) return { ok: false, status: "ERROR", reason: `Blocked by SSRF policy: ${pre.reason}` };
 
   await fs.mkdir(SCREENSHOT_DIR, { recursive: true });
-  const browser = await chromium.launch({ headless: true, args: ["--no-sandbox"] });
+ const browser = await chromium.launch({
+  headless: true,
+  args: [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage", // CRITICAL for Render/Docker
+    "--disable-gpu",
+    "--single-process",        // Runs Chromium in one process to save RAM
+    "--no-zygote"              // Further reduces memory
+  ],
+});
   try {
     const ctx = await browser.newContext({
       userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
@@ -34,6 +44,7 @@ export async function fetchPage(url: string): Promise<ScrapeResult> {
       serviceWorkers: "block", // a service worker could fetch around the route guard below
       deviceScaleFactor: 2
     });
+    await ctx.route("**/*.{png,jpg,jpeg,webp,svg,gif,woff,woff2}", route => route.abort());
     // Every request the page makes (the navigation, each redirect hop, iframes,
     // XHR/fetch, images) goes through this guard, not just the first URL.
     await ctx.route("**/*", async (route) => {
