@@ -2,15 +2,13 @@
   "name": "website-detector",
   "version": "1.0.0",
   "main": "index.js",
-  
   "scripts": {
     "dev": "ts-node src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
     "test": "node test.js",
-    "postinstall": "playwright install chromium" 
+    "postinstall": "playwright install chromium"
   },
-    
   "keywords": [],
   "author": "",
   "license": "ISC",
@@ -28,9 +26,10 @@
     "express": "^4.21.2",
     "express-async-errors": "^3.1.1",
     "express-rate-limit": "^8.7.1",
+    "form-data": "^4.0.6",
     "ioredis": "^5.4.1",
     "node-cron": "^3.0.3",
-    "nodemailer": "^6.9.16",
+    "nodemailer": "^6.10.1",
     "pixelmatch": "^5.3.0",
     "playwright": "^1.47.2",
     "playwright-extra": "^4.3.6",
@@ -48,7 +47,7 @@
     "@types/express": "^4.17.21",
     "@types/node": "^22.10.2",
     "@types/node-cron": "^3.0.11",
-    "@types/nodemailer": "^6.4.17",
+    "@types/nodemailer": "^6.4.24",
     "@types/pixelmatch": "^5.2.6",
     "@types/pngjs": "^6.0.5",
     "@types/swagger-jsdoc": "^6.0.4",

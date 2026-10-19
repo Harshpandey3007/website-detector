@@ -1,6 +1,9 @@
 import swaggerUi from "swagger-ui-express";
 import cors from "cors";
-
+import { registerClient } from "./events";
+import { getChannelStatus, sendTestAlert } from "./alerts";
+import { answerAboutHistory } from "./ai";
+import { demoRouter } from "./demoTarget";
 
 import { swaggerSpec } from "./swagger";
 import { register } from "./metrics";
@@ -75,7 +78,8 @@ app.get("/", (_req, res) => {
     ],
   });
 });
-
+// Demo target you control (only exists when DEMO_KEY is set). Must stay above authenticate:
+if (process.env.DEMO_KEY) app.use("/demo", demoRouter);
 // Everything below requires a valid, non-revoked key.
 app.use(authenticate);
 
@@ -185,7 +189,49 @@ app.get("/alerts", async (req, res) => {
   });
   res.json(alerts);
 });
+// --- Live event stream (Server-Sent Events) ---
+app.get("/events", (req, res) => {
+  res.set({
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  res.flushHeaders();
+  res.write("retry: 3000\n\n");
+  registerClient(res, ownerId(req));
+});
 
+// --- "Ask your history" ---
+const askLimiter = rateLimit({ windowMs: 60_000, limit: 10, standardHeaders: true, legacyHeaders: false });
+const askSchema = z.object({ question: z.string().trim().min(3).max(300) });
+
+app.post("/monitors/:id/ask", askLimiter, async (req, res) => {
+  const m = await findOwned(req);
+  if (!m) return res.status(404).json({ error: "Not found" });
+  const parsed = askSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "question required (3-300 chars)" });
+
+  const snaps = await prisma.snapshot.findMany({
+    where: { monitorId: m.id },
+    orderBy: { createdAt: "desc" },
+    take: 6,
+    select: { createdAt: true, textContent: true },
+  });
+  if (!snaps.length) return res.status(409).json({ error: "No snapshots yet." });
+
+  const answer = await answerAboutHistory(
+    parsed.data.question,
+    snaps.reverse().map((s) => ({ capturedAt: s.createdAt, text: s.textContent })),
+  );
+  if (!answer) return res.status(503).json({ error: "AI unavailable (is GEMINI_API_KEY set?)" });
+  res.json({ answer, basedOn: snaps.length });
+});
+
+// --- Notification channels ---
+const testLimiter = rateLimit({ windowMs: 60_000, limit: 5, standardHeaders: true, legacyHeaders: false });
+app.get("/channels", (_req, res) => res.json(getChannelStatus()));
+app.post("/channels/test", testLimiter, async (_req, res) => res.json({ results: await sendTestAlert() }));
 app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
   const status = Number(err?.status ?? err?.statusCode) || 500;
   if (status >= 500) console.error(err);
