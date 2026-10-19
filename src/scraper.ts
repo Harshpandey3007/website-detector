@@ -32,6 +32,7 @@ export async function fetchPage(url: string): Promise<ScrapeResult> {
       userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
       viewport: { width: 1440, height: 900 },
       serviceWorkers: "block", // a service worker could fetch around the route guard below
+      deviceScaleFactor: 2
     });
     // Every request the page makes (the navigation, each redirect hop, iframes,
     // XHR/fetch, images) goes through this guard, not just the first URL.

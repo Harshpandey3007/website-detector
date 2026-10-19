@@ -105,8 +105,8 @@ async function sendTelegram(html: string, opts: { photoPath?: string | null; but
       form.append("caption", html);
       form.append("parse_mode", "HTML");
       if (markup) form.append("reply_markup", JSON.stringify(markup));
-      form.append("photo", await fs.readFile(opts.photoPath), { filename: "visual-diff.png", contentType: "image/png" });
-      await telegramCall(cfg.token, "sendPhoto", form);
+      form.append("document", await fs.readFile(opts.photoPath), { filename: "visual-diff.png", contentType: "image/png" });
+      await telegramCall(cfg.token, "sendDocument", form);
       return;
     } catch (err) {
       console.warn("Telegram photo failed, falling back to text:", err instanceof Error ? err.message : err);
